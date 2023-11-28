@@ -5,18 +5,23 @@
 We follow the approach introduced by Stallmann and Wilbik (2022),
 but implementing it for classical kmeans.
 """
+import random
+
 import numpy as np
 import pandas as pd
 
 from scipy.spatial import distance
 from sklearn.cluster import KMeans
+from sklearn.cluster import kmeans_plusplus
 from vantage6.tools.util import info
 from v6_kmeans_py.helper import coordinate_task
 
 
 def master(
         client, data: pd.DataFrame, k: int, epsilon: int = 0.05,
-        max_iter: int = 300, columns: list = None, org_ids: list = None
+        max_iter: int = 300, columns: list = None, org_ids: list = None,
+        d_init: str = 'all', init_method: str = 'random',
+        avg_method: str = 'k-means'
 ) -> dict:
     """ Master algorithm that coordinates the tasks and performs averaging
 
@@ -36,6 +41,12 @@ def master(
         Columns to be used for clustering
     org_ids
         List with organisation ids to be used
+    d_init
+        Which data nodes to use for initialisation ('all' or 'random')
+    init_method
+        Method to be used for centroids initialisation ('random' or 'k-means++')
+    avg_method
+        Method used to get global centroids ('simple_avg' or 'k-means')
 
     Returns
     -------
@@ -50,15 +61,38 @@ def master(
     ids = [organization.get('id') for organization in organizations
            if not org_ids or organization.get('id') in org_ids]
 
-    # Initialise k global cluster centroids, for now start with k random points
-    # drawn from the first data node
+    # Checking centroids initialisation input parameters
+    if d_init not in ['all', 'random']:
+        info(f'Initialisation option {d_init} not available, using all nodes')
+        d_init = 'all'
+    if init_method not in ['random', 'k-means++']:
+        info(f'Initialisation option {init_method} not available, using random')
+        init_method = 'random'
+    if avg_method not in ['simple_avg', 'k-means']:
+        info(f'Initialisation option {avg_method} not available, using k-means')
+        avg_method = 'k-means'
+
+    # Initialise k global cluster centroids
     info('Initializing k global cluster centres')
     input_ = {
         'method': 'initialize_centroids_partial',
-        'kwargs': {'k': k, 'columns': columns}
+        'kwargs': {'k': k, 'columns': columns, 'method': init_method}
     }
-    results = coordinate_task(client, input_, ids[:1])
-    centroids = results[0]
+    if d_init == 'all':
+        # Draw from all nodes and then re-draw
+        results = coordinate_task(client, input_, ids)
+        results = [centroid for result in results for centroid in result]
+        if init_method == 'random':
+            centroids = random.sample(results, k)
+        else:
+            X = np.array(results)
+            centroids, indices = kmeans_plusplus(X, n_clusters=k)
+            centroids = centroids.tolist()
+    else:
+        # Draw from random data node
+        random_id = [random.choice(ids)]
+        results = coordinate_task(client, input_, random_id)
+        centroids = results[0]
 
     # The next steps are run until convergence is achieved or the maximum
     # number of iterations reached. In order to evaluate convergence,
@@ -78,19 +112,24 @@ def master(
         # Send partial task and collect results
         results = coordinate_task(client, input_, ids)
 
-        # Organise local centroids into a matrix
-        local_centroids = []
-        for result in results:
-            for local_centroid in result:
-                local_centroids.append(local_centroid)
-        X = np.array(local_centroids)
-
-        # Average centroids by running kmeans on local results
-        # TODO: add other averaging options
+        # Get global centroids
         info('Run global averaging for centroids')
-        kmeans = KMeans(n_clusters=k, random_state=0).fit(X)
-        info(f'Kmeans result {kmeans}')
-        new_centroids = kmeans.cluster_centers_
+        if avg_method == 'k-means':
+            info('Running k-Means on local clusters')
+            local_centroids = [
+                centroid for result in results for centroid in result
+            ]
+            X = np.array(local_centroids)
+            kmeans = KMeans(n_clusters=k, random_state=42).fit(X)
+            new_centroids = kmeans.cluster_centers_
+        else:
+            info('Running simple average on local clusters')
+            new_centroids = np.zeros([k, len(columns)])
+            for i in range(len(ids)):
+                for j in range(k):
+                    for p in range(len(columns)):
+                        new_centroids[j, p] += results[i][j][p]
+            new_centroids = new_centroids / len(ids)
 
         # Compute the sum of the magnitudes of the centroids differences
         # between steps. This change in centroids between steps will be used
@@ -116,9 +155,9 @@ def master(
 
 
 def RPC_initialize_centroids_partial(
-        data: pd.DataFrame, k: int, columns: list = None
+        data: pd.DataFrame, k: int, columns: list = None, method: str = 'random'
 ) -> list:
-    """ Initialise global centroids for kmeans
+    """ Initialise centroids for kmeans
 
     Parameters
     ----------
@@ -128,26 +167,27 @@ def RPC_initialize_centroids_partial(
         Number of clusters
     columns
         Columns to be used for clustering
+    method
+        Method to be used for centroids initialisation ('random' or 'k-means++')
 
     Returns
     -------
     centroids
-        Initial guess for global centroids
+        Initial guess for centroids
     """
     # Drop rows with NaNs
-    data = data.dropna(how='any')
+    data = data.dropna(subset=columns)
 
-    # TODO: use a better method to initialize centroids
-    info(f'Randomly sample {k} data points to use as initial centroids')
-    if columns:
+    # Initialise local centroids
+    if method == 'random':
+        info(f'Randomly sample {k} data points to use as initial centroids')
         df = data[columns].sample(k)
+        centroids = df.values.tolist()
     else:
-        df = data.sample(k)
-
-    # Organise initial guess for centroids as a list
-    centroids = []
-    for index, row in df.iterrows():
-        centroids.append(row.values.tolist())
+        info(f'Sampling {k} data points using k-means++')
+        X = data[columns].values
+        centroids, indices = kmeans_plusplus(X, n_clusters=k)
+        centroids = centroids.tolist()
 
     return centroids
 
@@ -174,7 +214,7 @@ def RPC_kmeans_partial(
         List with the partial result for centroids
     """
     # Drop rows with NaNs
-    df = df.dropna(how='any')
+    df = df.dropna(subset=columns)
 
     info('Selecting columns')
     if columns:
